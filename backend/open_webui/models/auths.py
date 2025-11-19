@@ -83,6 +83,10 @@ class SignupForm(BaseModel):
     email: str
     password: str
     profile_image_url: Optional[str] = "/user.png"
+    plan_id: Optional[str] = None  # Subscription plan ID
+    payment_id: Optional[str] = None  # Payment gateway transaction ID
+    dob: Optional[str] = None  # Date of birth (YYYY-MM-DD format)
+    phone: Optional[str] = None  # Phone number
 
 
 class AddUserForm(SignupForm):
@@ -98,27 +102,62 @@ class AuthsTable:
         profile_image_url: str = "/user.png",
         role: str = "pending",
         oauth_sub: Optional[str] = None,
+        dob: Optional[str] = None,
+        phone: Optional[str] = None,
     ) -> Optional[UserModel]:
+        import time
+        from datetime import datetime
+        from open_webui.models.users import User, UserModel
+        
         with get_db() as db:
             log.info("insert_new_auth")
 
             id = str(uuid.uuid4())
 
+            # Create auth record
             auth = AuthModel(
                 **{"id": id, "email": email, "password": password, "active": True}
             )
-            result = Auth(**auth.model_dump())
-            db.add(result)
+            auth_result = Auth(**auth.model_dump())
+            db.add(auth_result)
 
-            user = Users.insert_new_user(
-                id, name, email, profile_image_url, role, oauth_sub
-            )
+            # Parse date of birth if provided
+            date_of_birth = None
+            if dob:
+                try:
+                    date_of_birth = datetime.strptime(dob, "%Y-%m-%d").date()
+                except ValueError:
+                    log.warning(f"Invalid date format for DOB: {dob}")
 
+            # Create user record in the same transaction
+            user_data = {
+                "id": id,
+                "name": name,
+                "email": email,
+                "role": role,
+                "profile_image_url": profile_image_url,
+                "last_active_at": int(time.time()),
+                "created_at": int(time.time()),
+                "updated_at": int(time.time()),
+                "oauth_sub": oauth_sub,
+            }
+            
+            if date_of_birth:
+                user_data["date_of_birth"] = date_of_birth
+            if phone:
+                user_data["phone"] = phone
+            
+            user_model = UserModel(**user_data)
+            user_result = User(**user_model.model_dump())
+            db.add(user_result)
+
+            # Commit both records in single transaction
             db.commit()
-            db.refresh(result)
+            db.refresh(auth_result)
+            db.refresh(user_result)
 
-            if result and user:
-                return user
+            if auth_result and user_result:
+                return user_model
             else:
                 return None
 
