@@ -317,6 +317,58 @@ if JWT_EXPIRES_IN.value == "-1":
     )
 
 ####################################
+# Email Configuration
+####################################
+
+SMTP_HOST = PersistentConfig(
+    "SMTP_HOST",
+    "email.smtp.host",
+    os.environ.get("SMTP_HOST", "smtp.gmail.com"),
+)
+
+SMTP_PORT = PersistentConfig(
+    "SMTP_PORT",
+    "email.smtp.port",
+    int(os.environ.get("SMTP_PORT", "587")),
+)
+
+SMTP_USERNAME = PersistentConfig(
+    "SMTP_USERNAME",
+    "email.smtp.username",
+    os.environ.get("SMTP_USERNAME", ""),
+)
+
+SMTP_PASSWORD = PersistentConfig(
+    "SMTP_PASSWORD",
+    "email.smtp.password",
+    os.environ.get("SMTP_PASSWORD", ""),
+)
+
+SMTP_FROM_EMAIL = PersistentConfig(
+    "SMTP_FROM_EMAIL",
+    "email.smtp.from_email",
+    os.environ.get("SMTP_FROM_EMAIL", ""),
+)
+
+SMTP_FROM_NAME = PersistentConfig(
+    "SMTP_FROM_NAME",
+    "email.smtp.from_name",
+    os.environ.get("SMTP_FROM_NAME", "OptimalMD"),
+)
+
+SMTP_USE_TLS = PersistentConfig(
+    "SMTP_USE_TLS",
+    "email.smtp.use_tls",
+    os.environ.get("SMTP_USE_TLS", "True").lower() == "true",
+)
+
+ENABLE_SIGNUP_EMAIL = PersistentConfig(
+    "ENABLE_SIGNUP_EMAIL",
+    "email.signup.enable",
+    os.environ.get("ENABLE_SIGNUP_EMAIL", "True").lower() == "true",
+)
+
+####################################
 # OAuth config
 ####################################
 

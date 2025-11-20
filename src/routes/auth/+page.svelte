@@ -10,6 +10,7 @@
 
 	import { getBackendConfig } from '$lib/apis';
 	import { ldapUserSignIn, getSessionUser, userSignIn, userSignUp } from '$lib/apis/auths';
+	import { getSubscriptionPlans } from '$lib/apis/subscriptions';
 
 	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
 	import { WEBUI_NAME, config, user, socket } from '$lib/stores';
@@ -19,6 +20,8 @@
 	import Spinner from '$lib/components/common/Spinner.svelte';
 	import OnBoarding from '$lib/components/OnBoarding.svelte';
 	import SensitiveInput from '$lib/components/common/SensitiveInput.svelte';
+	import SubscriptionPlans from '$lib/components/SubscriptionPlans.svelte';
+	import PaymentModal from '$lib/components/PaymentModal.svelte';
 	import { redirect } from '@sveltejs/kit';
 
 	const i18n = getContext('i18n');
@@ -28,6 +31,8 @@
 	let mode = $config?.features.enable_ldap ? 'ldap' : 'signin';
 
 	let form = null;
+	let orgCode = null; // Organization code from URL
+	let organization = null; // Organization data for signup
 
 	let name = '';
 	let email = '';
@@ -35,6 +40,35 @@
 	let confirmPassword = '';
 
 	let ldapUsername = '';
+	
+	// Subscription-related variables
+	let subscriptionPlans = [];
+	let selectedPlanId = null;
+	let showPaymentModal = false;
+	let selectedPlan = null;
+	let paymentId = null;
+	let signupStep = 'credentials'; // 'credentials' | 'plan-selection' | 'payment'
+
+	// Multi-step signup variables
+	let currentSignupStep = 1; // 1: Plan Info, 2: Personal Info, 3: Payment
+	let selectedPlanType: 'free' | 'paid' = 'free';
+	let paymentMethod: 'card' | 'bank' = 'card';
+	
+	// Personal Information
+	let firstName = '';
+	let lastName = '';
+	let phone = '';
+	let dateOfBirth = '';
+	
+	// Payment Information
+	let cardNumber = '';
+	let expirationDate = '';
+	let cvc = '';
+	let bankName = '';
+	let accountHolder = '';
+	let routingNumber = '';
+	let accountNumber = '';
+	let agreementChecked = false;
 
 	const setSessionUser = async (sessionUser, redirectPath: string | null = null) => {
 		if (sessionUser) {
@@ -65,6 +99,37 @@
 		await setSessionUser(sessionUser);
 	};
 
+	const loadSubscriptionPlans = async () => {
+		try {
+			const allPlans = await getSubscriptionPlans();
+			
+			// If we have an organization, filter plans to only show org plans
+			if (organization && organization.plans && organization.plans.length > 0) {
+				subscriptionPlans = allPlans.filter((plan) => organization.plans.includes(plan.id));
+			} else {
+				subscriptionPlans = allPlans;
+			}
+		} catch (error) {
+			console.error('Error loading subscription plans:', error);
+			subscriptionPlans = [];
+		}
+	};
+
+	const loadOrganizationInfo = async (code) => {
+		try {
+			const res = await fetch(`${WEBUI_API_BASE_URL}/organizations/public/code/${code}`);
+			
+			if (!res.ok) {
+				console.error('Organization not found');
+				return;
+			}
+
+			organization = await res.json();
+		} catch (error) {
+			console.error('Error loading organization:', error);
+		}
+	};
+	
 	const signUpHandler = async () => {
 		if ($config?.features?.enable_signup_password_confirmation) {
 			if (password !== confirmPassword) {
@@ -73,14 +138,251 @@
 			}
 		}
 
-		const sessionUser = await userSignUp(name, email, password, generateInitialsImage(name)).catch(
-			(error) => {
-				toast.error(`${error}`);
-				return null;
-			}
-		);
+		// If subscription plans are available, proceed to plan selection
+		if (subscriptionPlans.length > 0 && signupStep === 'credentials') {
+			signupStep = 'plan-selection';
+			return;
+		}
 
-		await setSessionUser(sessionUser);
+		// Show loading state
+		const loadingToast = toast.loading($i18n.t('Creating your account...'));
+
+		try {
+			// Complete signup with or without plan
+			const result = await userSignUp(
+				name, 
+				email, 
+				password, 
+				generateInitialsImage(name),
+				selectedPlanId,
+				paymentId,
+				dateOfBirth,
+				phone
+			);
+
+			toast.dismiss(loadingToast);
+
+			if (result) {
+				// Check if result is a success message (email sent) or session user (auto-login)
+				if (result.success && result.message) {
+					// Email sent successfully - show message and stay on signup page
+					toast.success(result.message);
+					
+					// Show additional info modal/message
+					toast.info($i18n.t('Please check your email inbox (and spam folder) for your temporary password.'), {
+						duration: 8000
+					});
+					
+					// Redirect to signin after a delay
+					setTimeout(() => {
+						mode = 'signin';
+						email = result.email || email;
+					}, 3000);
+				} else {
+					// Auto-login for first admin user
+					await setSessionUser(result);
+				}
+			} else {
+				toast.error($i18n.t('Account creation failed. Please try again.'));
+			}
+		} catch (error) {
+			toast.dismiss(loadingToast);
+			toast.error(`${error}`);
+		}
+	};
+
+	// Multi-step signup handlers
+	const handleSignupContinue = () => {
+		if (currentSignupStep === 1) {
+			if (!selectedPlanId) {
+				toast.error('Please select a subscription plan');
+				return;
+			}
+			currentSignupStep = 2;
+		} else if (currentSignupStep === 2) {
+			if (!firstName || !lastName || !email || !phone || !dateOfBirth) {
+				toast.error('Please fill in all required fields');
+				return;
+			}
+			// Set name from first and last name
+			name = `${firstName} ${lastName}`;
+			
+			// Check if selected plan is free
+			const plan = subscriptionPlans.find(p => p.id === selectedPlanId);
+			if (plan && (plan.price === 0 || (plan.plan_name || plan.name || '').toLowerCase().includes('free'))) {
+				// Skip payment for free plans
+				handleCompleteRegistration();
+			} else {
+				currentSignupStep = 3;
+			}
+		} else if (currentSignupStep === 3) {
+			handleCompleteRegistration();
+		}
+	};
+
+	const handleSignupBack = () => {
+		if (currentSignupStep > 1) {
+			currentSignupStep--;
+		}
+	};
+
+	const handleCompleteRegistration = async () => {
+		if (!agreementChecked) {
+			toast.error('Please acknowledge the disclaimer');
+			return;
+		}
+
+		// Generate a temporary password - backend will override this anyway for email signup
+		if (!password) {
+			password = 'temp_' + Math.random().toString(36).substring(7);
+		}
+
+		// Show loading state
+		const loadingToast = toast.loading($i18n.t('Creating your account...'));
+
+		try {
+			let result;
+			
+			// Use organization signup endpoint if org code is present
+			if (orgCode) {
+				const res = await fetch(`${WEBUI_API_BASE_URL}/auths/signup/org/${orgCode}`, {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json'
+					},
+					body: JSON.stringify({
+						name,
+						email,
+						password,
+						plan_id: selectedPlanId || null
+					})
+				});
+
+				if (!res.ok) {
+					const error = await res.json();
+					throw new Error(error.detail || 'Signup failed');
+				}
+
+				result = await res.json();
+			} else {
+				// Regular signup
+				result = await userSignUp(
+					name, 
+					email, 
+					password, 
+					generateInitialsImage(name),
+					selectedPlanId,
+					paymentId,
+					dateOfBirth,
+					phone
+				);
+			}
+
+			toast.dismiss(loadingToast);
+
+			if (result) {
+				// Check if result is a success message (email sent) or session user (auto-login)
+				if (result.success && result.message) {
+					// Email sent successfully - show message
+					toast.success(result.message);
+					
+					// Show additional info
+					toast.info($i18n.t('Please check your email inbox (and spam folder) for your temporary password.'), {
+						duration: 8000
+					});
+					
+					// Redirect to signin after a delay
+					setTimeout(() => {
+						mode = 'signin';
+						email = result.email || email;
+						currentSignupStep = 1; // Reset signup flow
+						orgCode = null; // Clear org code
+					}, 3000);
+				} else {
+					// Auto-login for first admin user only
+					await setSessionUser(result);
+				}
+			} else {
+				toast.error($i18n.t('Account creation failed. Please try again.'));
+			}
+		} catch (error) {
+			toast.dismiss(loadingToast);
+			toast.error(`${error}`);
+		}
+	};
+
+	const formatPhoneNumber = (value: string) => {
+		const cleaned = value.replace(/\D/g, '');
+		const match = cleaned.match(/^(\d{0,3})(\d{0,3})(\d{0,4})$/);
+		if (match) {
+			const formatted = !match[2] ? match[1] : `(${match[1]}) ${match[2]}${match[3] ? '-' + match[3] : ''}`;
+			return formatted;
+		}
+		return value;
+	};
+
+	const handlePhoneInput = (e: Event) => {
+		const target = e.target as HTMLInputElement;
+		phone = formatPhoneNumber(target.value);
+	};
+
+	const formatCardNumber = (value: string) => {
+		const cleaned = value.replace(/\s/g, '');
+		const match = cleaned.match(/.{1,4}/g);
+		return match ? match.join(' ') : cleaned;
+	};
+
+	const handleCardInput = (e: Event) => {
+		const target = e.target as HTMLInputElement;
+		cardNumber = formatCardNumber(target.value.replace(/\D/g, ''));
+	};
+
+	const formatExpiration = (value: string) => {
+		const cleaned = value.replace(/\D/g, '');
+		if (cleaned.length >= 2) {
+			return cleaned.substring(0, 2) + '/' + cleaned.substring(2, 4);
+		}
+		return cleaned;
+	};
+
+	const handleExpirationInput = (e: Event) => {
+		const target = e.target as HTMLInputElement;
+		expirationDate = formatExpiration(target.value);
+	};
+	
+	const handlePlanSelect = (planId: string) => {
+		selectedPlanId = planId;
+		selectedPlan = subscriptionPlans.find(p => p.id === planId);
+	};
+	
+	const proceedWithSelectedPlan = () => {
+		if (!selectedPlanId) {
+			toast.error('Please select a subscription plan');
+			return;
+		}
+		
+		// Show payment modal
+		signupStep = 'payment';
+		showPaymentModal = true;
+	};
+	
+	const handlePaymentSuccess = async (pId: string) => {
+		paymentId = pId;
+		showPaymentModal = false;
+		
+		// Complete signup with payment
+		await signUpHandler();
+	};
+	
+	const handlePaymentCancel = () => {
+		showPaymentModal = false;
+		signupStep = 'plan-selection';
+	};
+	
+	const skipPlanSelection = async () => {
+		// Allow signup without subscription (free tier)
+		selectedPlanId = null;
+		await signUpHandler();
 	};
 
 	const ldapSignInHandler = async () => {
@@ -132,9 +434,12 @@
 
 	async function setLogoImage() {
 		await tick();
-		const logo = document.getElementById('logo');
+		const logoLeft = document.getElementById('logo-left');
+		const logoMobile = document.getElementById('logo-mobile');
 
-		if (logo) {
+		const updateLogo = (logo) => {
+			if (!logo) return;
+			
 			const isDarkMode = document.documentElement.classList.contains('dark');
 
 			if (isDarkMode) {
@@ -149,8 +454,14 @@
 				darkImage.onerror = () => {
 					logo.style.filter = 'invert(1)'; // Invert image if favicon-dark.png is missing
 				};
+			} else {
+				logo.src = `${WEBUI_BASE_URL}/static/favicon.png`;
+				logo.style.filter = '';
 			}
-		}
+		};
+
+		updateLogo(logoLeft);
+		updateLogo(logoMobile);
 	}
 
 	onMount(async () => {
@@ -170,6 +481,16 @@
 
 		await oauthCallbackHandler();
 		form = $page.url.searchParams.get('form');
+		
+		// Check for organization code
+		orgCode = $page.url.searchParams.get('org');
+		if (orgCode) {
+			await loadOrganizationInfo(orgCode);
+			mode = 'signup'; // Force signup mode for organization
+		}
+		
+		// Load subscription plans (will be filtered by org if applicable)
+		await loadSubscriptionPlans();
 
 		loaded = true;
 		setLogoImage();
@@ -197,86 +518,642 @@
 />
 
 <div class="w-full h-screen max-h-[100dvh] text-white relative" id="auth-page">
-	<div class="w-full h-full absolute top-0 left-0 bg-white dark:bg-black"></div>
+	<div class="w-full h-full absolute top-0 left-0 bg-white dark:bg-gray-950"></div>
 
 	<div class="w-full absolute top-0 left-0 right-0 h-8 drag-region" />
 
 	{#if loaded}
 		<div
-			class="fixed bg-transparent min-h-screen w-full flex justify-center font-primary z-50 text-black dark:text-white"
+			class="fixed inset-0 bg-transparent w-full h-full flex font-primary z-50 text-black dark:text-white overflow-y-auto"
 			id="auth-container"
 		>
-			<div class="w-full px-10 min-h-screen flex flex-col text-center">
+			<div class="w-full min-h-full flex flex-col lg:flex-row"
+			>
 				{#if ($config?.features.auth_trusted_header ?? false) || $config?.features.auth === false}
-					<div class=" my-auto pb-10 w-full sm:max-w-md">
-						<div
-							class="flex items-center justify-center gap-3 text-xl sm:text-2xl text-center font-semibold dark:text-gray-200"
-						>
-							<div>
-								{$i18n.t('Signing in to {{WEBUI_NAME}}', { WEBUI_NAME: $WEBUI_NAME })}
-							</div>
+					<div class="w-full flex items-center justify-center px-6 py-10">
+						<div class="w-full max-w-md">
+							<div
+								class="flex items-center justify-center gap-3 text-xl sm:text-2xl text-center font-semibold dark:text-gray-200"
+							>
+								<div>
+									{$i18n.t('Signing in to {{WEBUI_NAME}}', { WEBUI_NAME: $WEBUI_NAME })}
+								</div>
 
-							<div>
-								<Spinner className="size-5" />
+								<div>
+									<Spinner className="size-5" />
+								</div>
 							</div>
 						</div>
 					</div>
 				{:else}
-					<div class="my-auto flex flex-col justify-center items-center">
-						<div class=" sm:max-w-md my-auto pb-10 w-full dark:text-gray-100">
-							{#if $config?.metadata?.auth_logo_position === 'center'}
-								<div class="flex justify-center mb-6">
+					<!-- Left Side - Branding (Only for Sign In, hidden for Signup) -->
+					{#if mode !== 'signup'}
+						<div class="hidden lg:flex lg:w-1/2 bg-gradient-to-br from-gray-50 to-gray-100 dark:from-gray-900 dark:to-gray-800 p-12 flex-col justify-center items-center">
+							<div class="max-w-xl text-center">
+								<!-- Logo -->
+								<div class="mb-8 flex justify-center">
 									<img
-										id="logo"
+										id="logo-left"
 										crossorigin="anonymous"
 										src="{WEBUI_BASE_URL}/static/favicon.png"
-										class="size-24 rounded-full"
-										alt=""
+										class="h-16 w-16 rounded-full"
+										alt="OptimalMD Logo"
 									/>
 								</div>
-							{/if}
-							<form
-								class=" flex flex-col justify-center"
-								on:submit={(e) => {
-									e.preventDefault();
-									submitHandler();
-								}}
-							>
-								<div class="mb-1">
-									<div class=" text-2xl font-medium">
-										{#if $config?.onboarding ?? false}
-											{$i18n.t(`Get started with {{WEBUI_NAME}}`, { WEBUI_NAME: $WEBUI_NAME })}
-										{:else if mode === 'ldap'}
-											{$i18n.t(`Sign in to {{WEBUI_NAME}} with LDAP`, { WEBUI_NAME: $WEBUI_NAME })}
-										{:else if mode === 'signin'}
-											{$i18n.t(`Sign in to {{WEBUI_NAME}}`, { WEBUI_NAME: $WEBUI_NAME })}
-										{:else}
-											{$i18n.t(`Sign up to {{WEBUI_NAME}}`, { WEBUI_NAME: $WEBUI_NAME })}
-										{/if}
+								
+								<!-- Main Heading -->
+								<h1 class="text-4xl font-bold text-gray-900 dark:text-white mb-4">
+									My AI Doctor™ - Your Diagnostic Companion
+								</h1>
+								
+								<!-- Subheading -->
+								<p class="text-xl text-gray-600 dark:text-gray-300">
+									Get Insights into Your Health Journey
+								</p>
+							</div>
+						</div>
+					{/if}
+
+					<!-- Right Side - Form (Full width for signup, half width for signin) -->
+					<div class="w-full {mode === 'signup' ? '' : 'lg:w-1/2'} flex {mode === 'signup' ? 'items-start' : 'items-center'} justify-center px-6 {mode === 'signup' ? 'py-6 pb-20' : 'py-10'} lg:px-12">
+						<div class="w-full {mode === 'signup' ? 'max-w-5xl' : 'max-w-md'} dark:text-gray-100">
+							<!-- Mobile Logo - Only visible on mobile -->
+							<div class="lg:hidden flex justify-center mb-8">
+								<img
+									id="logo-mobile"
+									crossorigin="anonymous"
+									src="{WEBUI_BASE_URL}/static/favicon.png"
+									class="h-16 w-16 rounded-full"
+									alt="OptimalMD Logo"
+								/>
+							</div>
+
+							<!-- Mobile Title - Only visible on mobile -->
+							<div class="lg:hidden mb-8 text-center">
+								<h1 class="text-2xl font-bold text-gray-900 dark:text-white mb-2">
+									My AI Doctor™
+								</h1>
+								<p class="text-sm text-gray-600 dark:text-gray-400">
+									Your Diagnostic Companion
+								</p>
+							</div>
+
+							{#if mode === 'signup'}
+								<!-- Multi-step Signup Process -->
+								<div class="mb-8 w-full">
+									<!-- Logo for Signup -->
+									<div class="flex justify-center mb-6">
+										<img
+											crossorigin="anonymous"
+											src="{WEBUI_BASE_URL}/static/favicon.png"
+											class="h-12 w-12 sm:h-16 sm:w-16 rounded-full"
+											alt="OptimalMD Logo"
+										/>
 									</div>
 
-									{#if $config?.onboarding ?? false}
-										<div class="mt-1 text-xs font-medium text-gray-600 dark:text-gray-500">
-											ⓘ {$WEBUI_NAME}
-											{$i18n.t(
-												'does not make any external connections, and your data stays securely on your locally hosted server.'
-											)}
+									<!-- Title -->
+									<div class="text-center mb-6">
+										<h1 class="text-xl sm:text-2xl lg:text-3xl font-bold text-gray-900 dark:text-white mb-2">
+											{#if organization}
+												Join {organization.org_name}
+											{:else}
+												Create Your Account
+											{/if}
+										</h1>
+										<p class="text-xs sm:text-sm text-gray-600 dark:text-gray-400">
+											{#if organization}
+												Create your account to access {organization.org_name}
+											{:else}
+												Join OptimalMD - Your AI-Powered Health Companion
+											{/if}
+										</p>
+									</div>
+
+									<!-- Progress Steps -->
+									<div class="w-full mb-8 px-4">
+										<div class="relative">
+											<!-- Progress Bar Background -->
+											<div class="absolute top-6 left-0 right-0 h-1 bg-gray-300 dark:bg-gray-600 rounded-full"></div>
+											
+											<!-- Progress Bar Fill -->
+											<div 
+												class="absolute top-6 left-0 h-1 bg-green-600 rounded-full transition-all duration-500 ease-in-out"
+												style="width: {currentSignupStep === 1 ? '0%' : currentSignupStep === 2 ? '50%' : '100%'}"
+											></div>
+
+											<!-- Steps Container -->
+											<div class="relative flex items-center justify-between">
+												<!-- Step 1 -->
+												<div class="flex flex-col items-start flex-1">
+													<div
+														class="w-12 h-12 rounded-full flex items-center justify-center transition-all duration-300 shadow-lg border-4 border-white dark:border-gray-900 {currentSignupStep >= 1
+															? 'bg-green-600 text-white'
+															: 'bg-gray-300 dark:bg-gray-600 text-gray-600 dark:text-gray-400'}"
+													>
+														{#if currentSignupStep > 1}
+															<svg class="w-6 h-6" fill="currentColor" viewBox="0 0 20 20">
+																<path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" />
+															</svg>
+														{:else}
+															<svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+																<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+															</svg>
+														{/if}
+													</div>
+													<span class="text-xs sm:text-sm mt-3 font-semibold {currentSignupStep >= 1 ? 'text-green-600' : 'text-gray-500 dark:text-gray-400'}">Plan Info</span>
+												</div>
+
+												<!-- Step 2 -->
+												<div class="flex flex-col items-center flex-1">
+													<div
+														class="w-12 h-12 rounded-full flex items-center justify-center transition-all duration-300 shadow-lg border-4 border-white dark:border-gray-900 {currentSignupStep >= 2
+															? 'bg-green-600 text-white'
+															: 'bg-gray-300 dark:bg-gray-600 text-gray-600 dark:text-gray-400'}"
+													>
+														{#if currentSignupStep > 2}
+															<svg class="w-6 h-6" fill="currentColor" viewBox="0 0 20 20">
+																<path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" />
+															</svg>
+														{:else}
+															<svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+																<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
+															</svg>
+														{/if}
+													</div>
+													<span class="text-xs sm:text-sm mt-3 font-semibold {currentSignupStep >= 2 ? 'text-green-600' : 'text-gray-500 dark:text-gray-400'}">Personal Information</span>
+												</div>
+
+												<!-- Step 3 -->
+												<div class="flex flex-col items-end flex-1">
+													<div
+														class="w-12 h-12 rounded-full flex items-center justify-center transition-all duration-300 shadow-lg border-4 border-white dark:border-gray-900 {currentSignupStep >= 3
+															? 'bg-green-600 text-white'
+															: 'bg-gray-300 dark:bg-gray-600 text-gray-600 dark:text-gray-400'}"
+													>
+														{#if currentSignupStep > 3}
+															<svg class="w-6 h-6" fill="currentColor" viewBox="0 0 20 20">
+																<path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" />
+															</svg>
+														{:else}
+															<svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+																<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z" />
+													</svg>
+														{/if}
+													</div>
+													<span class="text-xs sm:text-sm mt-3 font-semibold {currentSignupStep >= 3 ? 'text-green-600' : 'text-gray-500 dark:text-gray-400'}">Payment</span>
+												</div>
+											</div>
+										</div>
+									</div>
+
+									{#if currentSignupStep === 1}
+										<!-- Step 1: Plan Selection from Database -->
+										<div class="space-y-4">
+											{#if subscriptionPlans.length === 0}
+												<div class="text-center py-8">
+													<p class="text-gray-600 dark:text-gray-300">Loading subscription plans...</p>
+												</div>
+											{:else}
+												<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+													{#each subscriptionPlans as plan}
+														<button
+															type="button"
+															on:click={() => {
+																selectedPlanId = plan.id;
+																selectedPlan = plan;
+															}}
+															class="relative p-4 sm:p-6 border-2 rounded-xl text-left transition-all hover:shadow-lg {selectedPlanId === plan.id
+																? 'border-green-600 bg-green-50 dark:bg-green-900/20'
+																: 'border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700'}"
+														>
+															<div class="absolute top-4 right-4">
+																<span class="inline-block px-3 py-1 bg-green-600 text-white text-xs font-semibold rounded-full">
+																	{#if plan.price === 0 || (plan.plan_name || plan.name || '').toLowerCase().includes('free')}
+																		Free
+																	{:else}
+																		${plan.price} / {plan.duration_type || plan.interval || 'month'}
+																	{/if}
+																</span>
+															</div>
+
+															<h3 class="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white mb-2">{plan.plan_name || plan.name}</h3>
+															{#if plan.subtitle || plan.description}
+																<p class="text-gray-600 dark:text-gray-300 text-sm mb-4">
+																	{plan.subtitle || plan.description}
+																</p>
+															{/if}
+
+															{#if plan.benefits || plan.features}
+																<div class="space-y-2">
+																	<h4 class="font-semibold text-gray-900 dark:text-white text-sm">Features</h4>
+																	<ul class="space-y-1 text-sm text-gray-600 dark:text-gray-300">
+																		{#if plan.benefits && Array.isArray(plan.benefits)}
+																			{#each plan.benefits as benefit}
+																				<li class="flex items-start">
+																					<svg class="w-4 h-4 mr-2 mt-0.5 text-green-500 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+																						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+																					</svg>
+																					<span>{benefit}</span>
+																				</li>
+																			{/each}
+																		{:else if plan.features}
+																			{#if plan.features.maxChats}
+																				<li class="flex items-start">
+																					<svg class="w-4 h-4 mr-2 mt-0.5 text-green-500 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+																						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+																					</svg>
+																					<span>{plan.features.maxChats === -1 ? 'Unlimited chats' : `${plan.features.maxChats} chats`}</span>
+																				</li>
+																			{/if}
+																			{#if plan.features.maxModels}
+																				<li class="flex items-start">
+																					<svg class="w-4 h-4 mr-2 mt-0.5 text-green-500 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+																						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+																					</svg>
+																					<span>{plan.features.maxModels === -1 ? 'All AI models' : `${plan.features.maxModels} AI models`}</span>
+																				</li>
+																			{/if}
+																			{#if plan.features.prioritySupport}
+																				<li class="flex items-start">
+																					<svg class="w-4 h-4 mr-2 mt-0.5 text-green-500 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+																						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+																					</svg>
+																					<span>Priority support</span>
+																				</li>
+																			{/if}
+																			{#if plan.features.customFeatures && Array.isArray(plan.features.customFeatures)}
+																				{#each plan.features.customFeatures as feature}
+																					<li class="flex items-start">
+																						<svg class="w-4 h-4 mr-2 mt-0.5 text-green-500 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+																							<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+																						</svg>
+																						<span>{feature}</span>
+																					</li>
+																				{/each}
+																			{/if}
+																		{/if}
+																	</ul>
+																</div>
+															{/if}
+
+															{#if selectedPlanId === plan.id}
+																<div class="mt-4 flex items-center justify-center">
+																	<svg class="w-6 h-6 text-green-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+																		<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+																	</svg>
+																	<span class="ml-2 font-semibold text-green-600">Selected</span>
+																</div>
+															{/if}
+														</button>
+													{/each}
+												</div>
+											{/if}
+										</div>
+									{:else if currentSignupStep === 2}
+										<!-- Step 2: Personal Information -->
+										<div class="space-y-4">
+											<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+												<div>
+													<label for="firstName" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+														First name<span class="text-red-500">*</span>
+													</label>
+													<input
+														type="text"
+														id="firstName"
+														bind:value={firstName}
+														placeholder="Enter your first name"
+														class="w-full px-4 py-3 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition"
+														required
+													/>
+												</div>
+
+												<div>
+													<label for="lastName" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+														Last name<span class="text-red-500">*</span>
+													</label>
+													<input
+														type="text"
+														id="lastName"
+														bind:value={lastName}
+														placeholder="Enter your last name"
+														class="w-full px-4 py-3 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition"
+														required
+													/>
+												</div>
+											</div>
+
+											<div>
+												<label for="email" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+													Email address<span class="text-red-500">*</span>
+												</label>
+												<input
+													type="email"
+													id="email"
+													bind:value={email}
+													placeholder="Enter your email address"
+													class="w-full px-4 py-3 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition"
+													required
+												/>
+											</div>
+
+											<div>
+												<label for="phone" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+													Phone number<span class="text-red-500">*</span>
+												</label>
+												<input
+													type="tel"
+													id="phone"
+													bind:value={phone}
+													on:input={handlePhoneInput}
+													placeholder="(xxx) xxx-xxxx"
+													maxlength="14"
+													class="w-full px-4 py-3 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition"
+													required
+												/>
+											</div>
+
+											<div>
+												<label for="dob" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+													Date of birth<span class="text-red-500">*</span>
+												</label>
+												<input
+													type="date"
+													id="dob"
+													bind:value={dateOfBirth}
+													class="w-full px-4 py-3 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition"
+													required
+												/>
+											</div>
+										</div>
+									{:else if currentSignupStep === 3}
+										<!-- Step 3: Payment -->
+										<div class="space-y-4">
+											{#if selectedPlan && selectedPlan.price > 0}
+												<!-- Show plan summary -->
+												<div class="p-4 bg-gray-50 dark:bg-gray-700/50 rounded-lg mb-4">
+													<h4 class="font-semibold text-gray-900 dark:text-white mb-2">Selected Plan</h4>
+													<p class="text-lg font-bold text-gray-900 dark:text-white">{selectedPlan.plan_name || selectedPlan.name}</p>
+													<p class="text-2xl font-bold text-green-600 dark:text-green-400">
+														${selectedPlan.price.toFixed(2)} 
+														<span class="text-sm font-normal text-gray-600 dark:text-gray-400">
+															/ {selectedPlan.duration_type || selectedPlan.interval || 'month'}
+														</span>
+													</p>
+												</div>
+
+												<!-- Payment Method Toggle -->
+												<div class="flex justify-center space-x-4 mb-4">
+													<button
+														type="button"
+														on:click={() => (paymentMethod = 'card')}
+														class="flex items-center px-4 py-2 rounded-lg border-2 transition-all text-sm {paymentMethod === 'card'
+															? 'border-green-600 bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-300'
+															: 'border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-300'}"
+													>
+														<svg class="w-5 h-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+															<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z" />
+														</svg>
+														Card
+													</button>
+
+													<button
+														type="button"
+														on:click={() => (paymentMethod = 'bank')}
+														class="flex items-center px-4 py-2 rounded-lg border-2 transition-all text-sm {paymentMethod === 'bank'
+															? 'border-green-600 bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-300'
+															: 'border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-300'}"
+													>
+														<svg class="w-5 h-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+															<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 14v3m4-3v3m4-3v3M3 21h18M3 10h18M3 7l9-4 9 4M4 10h16v11H4V10z" />
+														</svg>
+														Bank
+													</button>
+												</div>
+
+												{#if paymentMethod === 'card'}
+													<!-- Card Payment Form -->
+													<div class="space-y-4">
+														<div>
+															<label for="cardNumber" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+																Card number<span class="text-red-500">*</span>
+															</label>
+															<input
+																type="text"
+																id="cardNumber"
+																bind:value={cardNumber}
+																on:input={handleCardInput}
+																placeholder="xxxx xxxx xxxx xxxx"
+																maxlength="19"
+																class="w-full px-4 py-3 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition"
+															/>
+														</div>
+
+														<div class="grid grid-cols-2 gap-4">
+															<div>
+																<label for="expiration" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+																	Expiration (MM/YY)<span class="text-red-500">*</span>
+																</label>
+																<input
+																	type="text"
+																	id="expiration"
+																	bind:value={expirationDate}
+																	on:input={handleExpirationInput}
+																	placeholder="MM/YY"
+																	maxlength="5"
+																	class="w-full px-4 py-3 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition"
+																/>
+															</div>
+
+															<div>
+																<label for="cvc" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+																	CVC<span class="text-red-500">*</span>
+																</label>
+																<input
+																	type="text"
+																	id="cvc"
+																	bind:value={cvc}
+																	placeholder="123"
+																	maxlength="4"
+																	class="w-full px-4 py-3 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition"
+																/>
+															</div>
+														</div>
+													</div>
+												{:else}
+													<!-- Bank Payment Form -->
+													<div class="space-y-4">
+														<div>
+															<label for="bankName" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+																Bank name<span class="text-red-500">*</span>
+															</label>
+															<input
+																type="text"
+																id="bankName"
+																bind:value={bankName}
+																placeholder="Bank"
+																class="w-full px-4 py-3 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition"
+															/>
+														</div>
+
+														<div>
+															<label for="accountHolder" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+																Account holder<span class="text-red-500">*</span>
+															</label>
+															<input
+																type="text"
+																id="accountHolder"
+																bind:value={accountHolder}
+																placeholder="Account name"
+																class="w-full px-4 py-3 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition"
+															/>
+														</div>
+
+														<div>
+															<label for="routingNumber" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+																Routing number<span class="text-red-500">*</span>
+															</label>
+															<input
+																type="text"
+																id="routingNumber"
+																bind:value={routingNumber}
+																placeholder="Routing number"
+																maxlength="9"
+																class="w-full px-4 py-3 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition"
+															/>
+														</div>
+
+														<div>
+															<label for="accountNumber" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+																Account number<span class="text-red-500">*</span>
+															</label>
+															<input
+																type="text"
+																id="accountNumber"
+																bind:value={accountNumber}
+																placeholder="Account number"
+																class="w-full px-4 py-3 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition"
+															/>
+														</div>
+													</div>
+												{/if}
+											{:else}
+												<!-- Free Plan - No payment needed -->
+												<div class="text-center py-6">
+													<div class="inline-flex items-center justify-center w-16 h-16 bg-green-100 dark:bg-green-900/30 rounded-full mb-4">
+														<svg class="w-8 h-8 text-green-600 dark:text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+															<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+														</svg>
+													</div>
+													<h3 class="text-xl font-bold text-gray-900 dark:text-white mb-2">
+														{selectedPlan ? (selectedPlan.plan_name || selectedPlan.name) : 'Free Plan Selected'}
+													</h3>
+													<p class="text-gray-600 dark:text-gray-300 text-sm">
+														No payment required. Your account will be created with the free plan.
+													</p>
+												</div>
+											{/if}
+
+											<!-- Disclaimer -->
+											<div class="flex items-start space-x-3 p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg">
+												<input
+													type="checkbox"
+													id="agreement"
+													bind:checked={agreementChecked}
+													class="mt-1 h-4 w-4 text-green-600 border-gray-300 dark:border-gray-600 rounded focus:ring-green-500"
+												/>
+												<label for="agreement" class="text-xs text-gray-600 dark:text-gray-300">
+													By entering this site, you fully acknowledge this is not medical advice and not intended to replace
+													the relationship with your physician. OptimalMD accepts no responsibility for actions taken based on
+													the information gained from this AI diagnostic tool. It is for educational and research use only.
+													<button type="button" class="text-blue-600 dark:text-blue-400 hover:underline ml-1">Show less</button>
+												</label>
+											</div>
+										</div>
+									{/if}
+
+									<!-- Navigation Buttons -->
+									<div class="flex gap-3 mt-6">
+										{#if currentSignupStep > 1}
+											<button
+												type="button"
+												on:click={handleSignupBack}
+												class="flex-1 px-4 py-3 bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-gray-800 dark:text-gray-200 font-semibold rounded-lg transition-all text-sm"
+											>
+												Back
+											</button>
+										{/if}
+
+										<button
+											type="button"
+											on:click={handleSignupContinue}
+											class="flex-1 px-4 py-3 bg-gray-900 dark:bg-gray-700 hover:bg-gray-800 dark:hover:bg-gray-600 text-white font-semibold rounded-lg transition-all text-sm"
+										>
+											{currentSignupStep < 3 ? 'Continue' : 'Complete registration'}
+										</button>
+									</div>
+
+									<!-- Sign In Link -->
+									{#if currentSignupStep === 1}
+										<div class="text-center mt-4">
+											<span class="text-sm text-gray-600 dark:text-gray-400">Already have an account?</span>
+											<button
+												type="button"
+												class="text-sm text-green-600 dark:text-green-400 hover:underline ml-1 font-semibold"
+												on:click={() => {
+													mode = 'signin';
+													currentSignupStep = 1;
+												}}
+											>
+												Sign in
+											</button>
 										</div>
 									{/if}
 								</div>
+							{:else}
+								<!-- Regular Sign In / LDAP Form -->
+								<form
+									class="flex flex-col"
+									on:submit={(e) => {
+										e.preventDefault();
+										submitHandler();
+									}}
+								>
+									<!-- Form Title -->
+									<div class="mb-6">
+										<h2 class="text-2xl lg:text-3xl font-bold text-gray-900 dark:text-white">
+											{#if $config?.onboarding ?? false}
+												OptimalMD Member Registration
+											{:else if mode === 'ldap'}
+												OptimalMD Member Login
+											{:else if mode === 'signin'}
+												OptimalMD Member Login
+											{:else}
+												OptimalMD Member Registration
+											{/if}
+										</h2>
+
+										{#if $config?.onboarding ?? false}
+											<div class="mt-2 text-xs font-medium text-gray-600 dark:text-gray-400">
+												ⓘ {$WEBUI_NAME}
+												{$i18n.t(
+													'does not make any external connections, and your data stays securely on your locally hosted server.'
+												)}
+											</div>
+										{/if}
+									</div>
 
 								{#if $config?.features.enable_login_form || $config?.features.enable_ldap || form}
-									<div class="flex flex-col mt-4">
+									<div class="flex flex-col space-y-4">
 										{#if mode === 'signup'}
-											<div class="mb-2">
-												<label for="name" class="text-sm font-medium text-left mb-1 block"
+											<div>
+												<label for="name" class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2 block"
 													>{$i18n.t('Name')}</label
 												>
 												<input
 													bind:value={name}
 													type="text"
 													id="name"
-													class="my-0.5 w-full text-sm outline-hidden bg-transparent placeholder:text-gray-300 dark:placeholder:text-gray-600"
+													class="w-full px-4 py-3 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition"
 													autocomplete="name"
 													placeholder={$i18n.t('Enter Your Full Name')}
 													required
@@ -285,14 +1162,14 @@
 										{/if}
 
 										{#if mode === 'ldap'}
-											<div class="mb-2">
-												<label for="username" class="text-sm font-medium text-left mb-1 block"
+											<div>
+												<label for="username" class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2 block"
 													>{$i18n.t('Username')}</label
 												>
 												<input
 													bind:value={ldapUsername}
 													type="text"
-													class="my-0.5 w-full text-sm outline-hidden bg-transparent placeholder:text-gray-300 dark:placeholder:text-gray-600"
+													class="w-full px-4 py-3 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition"
 													autocomplete="username"
 													name="username"
 													id="username"
@@ -301,89 +1178,108 @@
 												/>
 											</div>
 										{:else}
-											<div class="mb-2">
-												<label for="email" class="text-sm font-medium text-left mb-1 block"
-													>{$i18n.t('Email')}</label
+											<div>
+												<label for="email" class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2 block"
+													>{$i18n.t('Email Address')} <span class="text-red-500">*</span></label
 												>
 												<input
 													bind:value={email}
 													type="email"
 													id="email"
-													class="my-0.5 w-full text-sm outline-hidden bg-transparent placeholder:text-gray-300 dark:placeholder:text-gray-600"
+													class="w-full px-4 py-3 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition"
 													autocomplete="email"
 													name="email"
-													placeholder={$i18n.t('Enter Your Email')}
+													placeholder="Use your OptimalMD email address."
 													required
 												/>
 											</div>
 										{/if}
 
 										<div>
-											<label for="password" class="text-sm font-medium text-left mb-1 block"
+											<label for="password" class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2 block"
 												>{$i18n.t('Password')}</label
 											>
 											<SensitiveInput
 												bind:value={password}
 												type="password"
 												id="password"
-												class="my-0.5 w-full text-sm outline-hidden bg-transparent placeholder:text-gray-300 dark:placeholder:text-gray-600"
+												inputClassName="w-full px-4 py-3 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition"
 												placeholder={$i18n.t('Enter Your Password')}
-												autocomplete={mode === 'signup' ? 'new-password' : 'current-password'}
-												name="password"
 												required
 											/>
+											{#if mode === 'signin'}
+												<div class="mt-2 text-right">
+													<button type="button" class="text-sm text-gray-600 dark:text-gray-400 hover:text-green-600 dark:hover:text-green-400 transition">
+														Forgot password?
+													</button>
+												</div>
+											{/if}
 										</div>
 
 										{#if mode === 'signup' && $config?.features?.enable_signup_password_confirmation}
-											<div class="mt-2">
+											<div>
 												<label
 													for="confirm-password"
-													class="text-sm font-medium text-left mb-1 block"
+													class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2 block"
 													>{$i18n.t('Confirm Password')}</label
 												>
 												<SensitiveInput
 													bind:value={confirmPassword}
 													type="password"
 													id="confirm-password"
-													class="my-0.5 w-full text-sm outline-hidden bg-transparent"
+													inputClassName="w-full px-4 py-3 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition"
 													placeholder={$i18n.t('Confirm Your Password')}
-													autocomplete="new-password"
-													name="confirm-password"
 													required
 												/>
 											</div>
 										{/if}
+
+										{#if mode === 'signin'}
+											<!-- Disclaimer Checkbox -->
+											<div class="flex items-start">
+												<input
+													type="checkbox"
+													id="disclaimer"
+													class="mt-1 h-4 w-4 text-green-600 border-gray-300 dark:border-gray-600 rounded focus:ring-green-500"
+													required
+												/>
+												<label for="disclaimer" class="ml-2 text-xs text-gray-600 dark:text-gray-400">
+													By entering this site, you fully acknowledge this is not medical advice and not intended to replace the relationship with your physician. OptimalMD accepts no responsibility for actions taken based on the information gained from this AI diagnostic tool. It is for educational and research use only. 
+													<button type="button" class="text-blue-600 dark:text-blue-400 hover:underline">Show less</button>
+												</label>
+											</div>
+										{/if}
 									</div>
 								{/if}
-								<div class="mt-5">
+								<div class="mt-6">
 									{#if $config?.features.enable_login_form || $config?.features.enable_ldap || form}
 										{#if mode === 'ldap'}
 											<button
-												class="bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
+												class="w-full bg-green-700 hover:bg-green-800 dark:bg-green-600 dark:hover:bg-green-700 text-white font-semibold py-3 px-4 rounded-lg transition duration-200 ease-in-out transform hover:scale-[1.02] focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2"
 												type="submit"
 											>
 												{$i18n.t('Authenticate')}
 											</button>
 										{:else}
 											<button
-												class="bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
+												class="w-full bg-green-700 hover:bg-green-800 dark:bg-green-600 dark:hover:bg-green-700 text-white font-semibold py-3 px-4 rounded-lg transition duration-200 ease-in-out transform hover:scale-[1.02] focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2"
 												type="submit"
 											>
 												{mode === 'signin'
-													? $i18n.t('Sign in')
+													? $i18n.t('Login')
 													: ($config?.onboarding ?? false)
 														? $i18n.t('Create Admin Account')
 														: $i18n.t('Create Account')}
 											</button>
 
 											{#if $config?.features.enable_signup && !($config?.onboarding ?? false)}
-												<div class=" mt-4 text-sm text-center">
+												<div class="mt-6 text-sm text-center text-gray-600 dark:text-gray-400">
 													{mode === 'signin'
 														? $i18n.t("Don't have an account?")
 														: $i18n.t('Already have an account?')}
 
 													<button
-														class=" font-medium underline"
+														class="font-semibold text-green-700 dark:text-green-500 hover:text-green-800 dark:hover:text-green-400 ml-1 transition"
 														type="button"
 														on:click={() => {
 															if (mode === 'signin') {
@@ -401,23 +1297,24 @@
 									{/if}
 								</div>
 							</form>
+							{/if}
 
 							{#if Object.keys($config?.oauth?.providers ?? {}).length > 0}
-								<div class="inline-flex items-center justify-center w-full">
-									<hr class="w-32 h-px my-4 border-0 dark:bg-gray-100/10 bg-gray-700/10" />
+								<div class="inline-flex items-center justify-center w-full my-6">
+									<hr class="flex-1 h-px border-0 bg-gray-300 dark:bg-gray-600" />
 									{#if $config?.features.enable_login_form || $config?.features.enable_ldap || form}
 										<span
-											class="px-3 text-sm font-medium text-gray-900 dark:text-white bg-transparent"
+											class="px-4 text-sm font-medium text-gray-500 dark:text-gray-400 bg-transparent"
 											>{$i18n.t('or')}</span
 										>
 									{/if}
 
-									<hr class="w-32 h-px my-4 border-0 dark:bg-gray-100/10 bg-gray-700/10" />
+									<hr class="flex-1 h-px border-0 bg-gray-300 dark:bg-gray-600" />
 								</div>
-								<div class="flex flex-col space-y-2">
+								<div class="flex flex-col space-y-3">
 									{#if $config?.oauth?.providers?.google}
 										<button
-											class="flex justify-center items-center bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
+											class="flex justify-center items-center border border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-800 text-gray-700 dark:text-gray-300 transition w-full rounded-lg font-medium text-sm py-3 px-4"
 											on:click={() => {
 												window.location.href = `${WEBUI_BASE_URL}/oauth/google/login`;
 											}}
@@ -425,7 +1322,7 @@
 											<svg
 												xmlns="http://www.w3.org/2000/svg"
 												viewBox="0 0 48 48"
-												class="size-6 mr-3"
+												class="size-5 mr-3"
 											>
 												<path
 													fill="#EA4335"
@@ -446,7 +1343,7 @@
 									{/if}
 									{#if $config?.oauth?.providers?.microsoft}
 										<button
-											class="flex justify-center items-center bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
+											class="flex justify-center items-center border border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-800 text-gray-700 dark:text-gray-300 transition w-full rounded-lg font-medium text-sm py-3 px-4"
 											on:click={() => {
 												window.location.href = `${WEBUI_BASE_URL}/oauth/microsoft/login`;
 											}}
@@ -454,7 +1351,7 @@
 											<svg
 												xmlns="http://www.w3.org/2000/svg"
 												viewBox="0 0 21 21"
-												class="size-6 mr-3"
+												class="size-5 mr-3"
 											>
 												<rect x="1" y="1" width="9" height="9" fill="#f25022" /><rect
 													x="1"
@@ -476,7 +1373,7 @@
 									{/if}
 									{#if $config?.oauth?.providers?.github}
 										<button
-											class="flex justify-center items-center bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
+											class="flex justify-center items-center border border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-800 text-gray-700 dark:text-gray-300 transition w-full rounded-lg font-medium text-sm py-3 px-4"
 											on:click={() => {
 												window.location.href = `${WEBUI_BASE_URL}/oauth/github/login`;
 											}}
@@ -484,7 +1381,7 @@
 											<svg
 												xmlns="http://www.w3.org/2000/svg"
 												viewBox="0 0 24 24"
-												class="size-6 mr-3"
+												class="size-5 mr-3"
 											>
 												<path
 													fill="currentColor"
@@ -496,7 +1393,7 @@
 									{/if}
 									{#if $config?.oauth?.providers?.oidc}
 										<button
-											class="flex justify-center items-center bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
+											class="flex justify-center items-center border border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-800 text-gray-700 dark:text-gray-300 transition w-full rounded-lg font-medium text-sm py-3 px-4"
 											on:click={() => {
 												window.location.href = `${WEBUI_BASE_URL}/oauth/oidc/login`;
 											}}
@@ -507,7 +1404,7 @@
 												viewBox="0 0 24 24"
 												stroke-width="1.5"
 												stroke="currentColor"
-												class="size-6 mr-3"
+												class="size-5 mr-3"
 											>
 												<path
 													stroke-linecap="round"
@@ -525,7 +1422,7 @@
 									{/if}
 									{#if $config?.oauth?.providers?.feishu}
 										<button
-											class="flex justify-center items-center bg-gray-700/5 hover:bg-gray-700/10 dark:bg-gray-100/5 dark:hover:bg-gray-100/10 dark:text-gray-300 dark:hover:text-white transition w-full rounded-full font-medium text-sm py-2.5"
+											class="flex justify-center items-center border border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-800 text-gray-700 dark:text-gray-300 transition w-full rounded-lg font-medium text-sm py-3 px-4"
 											on:click={() => {
 												window.location.href = `${WEBUI_BASE_URL}/oauth/feishu/login`;
 											}}
@@ -537,9 +1434,9 @@
 							{/if}
 
 							{#if $config?.features.enable_ldap && $config?.features.enable_login_form}
-								<div class="mt-2">
+								<div class="mt-4">
 									<button
-										class="flex justify-center items-center text-xs w-full text-center underline"
+										class="flex justify-center items-center text-xs w-full text-center text-gray-600 dark:text-gray-400 hover:text-green-600 dark:hover:text-green-400 transition"
 										type="button"
 										on:click={() => {
 											if (mode === 'ldap')
@@ -557,8 +1454,8 @@
 							{/if}
 						</div>
 						{#if $config?.metadata?.login_footer}
-							<div class="max-w-3xl mx-auto">
-								<div class="mt-2 text-[0.7rem] text-gray-500 dark:text-gray-400 marked">
+							<div class="max-w-3xl mx-auto mt-6">
+								<div class="text-xs text-gray-500 dark:text-gray-400 marked">
 									{@html DOMPurify.sanitize(marked($config?.metadata?.login_footer))}
 								</div>
 							</div>
@@ -567,21 +1464,48 @@
 				{/if}
 			</div>
 		</div>
-
-		{#if !$config?.metadata?.auth_logo_position}
-			<div class="fixed m-10 z-50">
-				<div class="flex space-x-2">
-					<div class=" self-center">
-						<img
-							id="logo"
-							crossorigin="anonymous"
-							src="{WEBUI_BASE_URL}/static/favicon.png"
-							class=" w-6 rounded-full"
-							alt=""
-						/>
-					</div>
-				</div>
-			</div>
-		{/if}
 	{/if}
 </div>
+
+<style>
+	#auth-page {
+		background: white;
+	}
+
+	:global(.dark) #auth-page {
+		background: rgb(3 7 18);
+	}
+
+	/* Ensure proper dark mode transitions */
+	#auth-container {
+		transition: background-color 0.3s ease;
+	}
+
+	/* Custom scrollbar for the form area */
+	#auth-container::-webkit-scrollbar {
+		width: 8px;
+	}
+
+	#auth-container::-webkit-scrollbar-track {
+		background: transparent;
+	}
+
+	#auth-container::-webkit-scrollbar-thumb {
+		background: rgba(156, 163, 175, 0.3);
+		border-radius: 4px;
+	}
+
+	:global(.dark) #auth-container::-webkit-scrollbar-thumb {
+		background: rgba(75, 85, 99, 0.5);
+	}
+
+	/* Date input styling */
+	input[type='date']::-webkit-calendar-picker-indicator {
+		filter: invert(0.5);
+		cursor: pointer;
+	}
+
+	:global(.dark) input[type='date']::-webkit-calendar-picker-indicator {
+		filter: invert(0.8);
+	}
+</style>

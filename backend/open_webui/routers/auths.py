@@ -3,6 +3,8 @@ import uuid
 import time
 import datetime
 import logging
+import secrets
+import string
 from aiohttp import ClientSession
 
 from open_webui.models.auths import (
@@ -20,6 +22,15 @@ from open_webui.models.auths import (
 from open_webui.models.users import Users, UpdateProfileForm
 from open_webui.models.groups import Groups
 from open_webui.models.oauth_sessions import OAuthSessions
+from open_webui.models.subscriptions import (
+    SubscriptionPlans,
+    UserSubscriptions,
+    CreateSubscriptionForm,
+)
+from open_webui.utils.email import (
+    EmailService,
+    get_welcome_email_template,
+)
 
 from open_webui.constants import ERROR_MESSAGES, WEBHOOK_MESSAGES
 from open_webui.env import (
@@ -35,7 +46,19 @@ from open_webui.env import (
 )
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import RedirectResponse, Response, JSONResponse
-from open_webui.config import OPENID_PROVIDER_URL, ENABLE_OAUTH_SIGNUP, ENABLE_LDAP
+from open_webui.config import (
+    OPENID_PROVIDER_URL, 
+    ENABLE_OAUTH_SIGNUP, 
+    ENABLE_LDAP,
+    SMTP_HOST,
+    SMTP_PORT,
+    SMTP_USERNAME,
+    SMTP_PASSWORD,
+    SMTP_FROM_EMAIL,
+    SMTP_FROM_NAME,
+    SMTP_USE_TLS,
+    ENABLE_SIGNUP_EMAIL,
+)
 from pydantic import BaseModel
 
 from open_webui.utils.misc import parse_duration, validate_email_format
@@ -64,6 +87,13 @@ router = APIRouter()
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MAIN"])
 
+
+def generate_random_password(length: int = 12) -> str:
+    """Generate a secure random password"""
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+    password = ''.join(secrets.choice(alphabet) for _ in range(length))
+    return password
+
 ############################
 # GetSessionUser
 ############################
@@ -78,6 +108,12 @@ class SessionUserInfoResponse(SessionUserResponse):
     bio: Optional[str] = None
     gender: Optional[str] = None
     date_of_birth: Optional[datetime.date] = None
+
+
+class SignupSuccessResponse(BaseModel):
+    success: bool
+    message: str
+    email: str
 
 
 @router.get("/", response_model=SessionUserInfoResponse)
@@ -508,15 +544,6 @@ async def signin(request: Request, response: Response, form_data: SigninForm):
 
             user = Auths.authenticate_user(admin_email.lower(), admin_password)
     else:
-        password_bytes = form_data.password.encode("utf-8")
-        if len(password_bytes) > 72:
-            # TODO: Implement other hashing algorithms that support longer passwords
-            log.info("Password too long, truncating to 72 bytes for bcrypt")
-            password_bytes = password_bytes[:72]
-
-            # decode safely — ignore incomplete UTF-8 sequences
-            form_data.password = password_bytes.decode("utf-8", errors="ignore")
-
         user = Auths.authenticate_user(form_data.email.lower(), form_data.password)
 
     if user:
@@ -571,7 +598,7 @@ async def signin(request: Request, response: Response, form_data: SigninForm):
 ############################
 
 
-@router.post("/signup", response_model=SessionUserResponse)
+@router.post("/signup")
 async def signup(request: Request, response: Response, form_data: SignupForm):
     has_users = Users.has_users()
 
@@ -601,23 +628,71 @@ async def signup(request: Request, response: Response, form_data: SignupForm):
     try:
         role = "admin" if not has_users else request.app.state.config.DEFAULT_USER_ROLE
 
-        # The password passed to bcrypt must be 72 bytes or fewer. If it is longer, it will be truncated before hashing.
-        if len(form_data.password.encode("utf-8")) > 72:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST,
-                detail=ERROR_MESSAGES.PASSWORD_TOO_LONG,
-            )
-
-        hashed = get_password_hash(form_data.password)
+        # Generate a random temporary password if email signup is enabled
+        if ENABLE_SIGNUP_EMAIL.value and has_users:
+            # Generate random password for new users (not the first admin)
+            temp_password = generate_random_password(12)
+            hashed = get_password_hash(temp_password)
+        else:
+            # For the first admin user, use the provided password
+            # The password passed to bcrypt must be 72 bytes or fewer. If it is longer, it will be truncated before hashing.
+            if len(form_data.password.encode("utf-8")) > 72:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    detail=ERROR_MESSAGES.PASSWORD_TOO_LONG,
+                )
+            temp_password = form_data.password
+            hashed = get_password_hash(form_data.password)
+        
+        # Check if subscription plan is required and valid
+        subscription = None
+        if form_data.plan_id:
+            plan = SubscriptionPlans.get_plan_by_id(form_data.plan_id)
+            if not plan:
+                raise HTTPException(
+                    status.HTTP_404_NOT_FOUND,
+                    detail="Invalid subscription plan",
+                )
+        
         user = Auths.insert_new_auth(
             form_data.email.lower(),
             hashed,
             form_data.name,
             form_data.profile_image_url,
             role,
+            dob=form_data.dob,
+            phone=form_data.phone,
         )
 
         if user:
+            # Create subscription if plan_id is provided
+            if form_data.plan_id:
+                subscription_form = CreateSubscriptionForm(
+                    plan_id=form_data.plan_id,
+                    payment_id=form_data.payment_id,
+                    payment_method="stripe",  # Default payment method
+                )
+                subscription = UserSubscriptions.create_subscription(
+                    user.id, subscription_form
+                )
+                
+                # Update user with subscription info
+                Users.update_user_by_id(
+                    user.id,
+                    {
+                        "subscription_id": subscription.id if subscription else None,
+                        "subscription_status": subscription.status if subscription else None,
+                    },
+                )
+                
+                # Add user to the plan's users array
+                plan = SubscriptionPlans.get_plan_by_id(form_data.plan_id)
+                if plan:
+                    SubscriptionPlans.add_user_to_plan(plan.id, user.id)
+                    
+                    # Add user to the plan's group to grant model access
+                    if plan.group:
+                        Groups.add_users_to_group(plan.group, [user.id])
             expires_delta = parse_duration(request.app.state.config.JWT_EXPIRES_IN)
             expires_at = None
             if expires_delta:
@@ -661,19 +736,63 @@ async def signup(request: Request, response: Response, form_data: SignupForm):
             )
 
             if not has_users:
-                # Disable signup after the first user is created
+                # Disable signup after the first user is created (first admin)
                 request.app.state.config.ENABLE_SIGNUP = False
-
+                
+                # For first admin user, auto-login with token
+                return {
+                    "token": token,
+                    "token_type": "Bearer",
+                    "expires_at": expires_at,
+                    "id": user.id,
+                    "email": user.email,
+                    "name": user.name,
+                    "role": user.role,
+                    "profile_image_url": user.profile_image_url,
+                    "permissions": user_permissions,
+                }
+            
+            # For non-admin users, send email with password
+            if ENABLE_SIGNUP_EMAIL.value:
+                try:
+                    # Initialize email service
+                    email_service = EmailService(
+                        smtp_host=SMTP_HOST.value,
+                        smtp_port=SMTP_PORT.value,
+                        smtp_username=SMTP_USERNAME.value,
+                        smtp_password=SMTP_PASSWORD.value,
+                        from_email=SMTP_FROM_EMAIL.value,
+                        from_name=SMTP_FROM_NAME.value,
+                        use_tls=SMTP_USE_TLS.value,
+                    )
+                    
+                    # Generate email template
+                    html_content = get_welcome_email_template(
+                        user_name=user.name,
+                        user_email=user.email,
+                        password=temp_password
+                    )
+                    
+                    # Send email
+                    email_sent = email_service.send_email(
+                        to_email=user.email,
+                        subject="Welcome to OptimalMD - Your Account Credentials",
+                        html_content=html_content
+                    )
+                    
+                    if not email_sent:
+                        log.error(f"Failed to send welcome email to {user.email}")
+                        # Continue anyway, user can reset password later
+                
+                except Exception as email_err:
+                    log.error(f"Error sending welcome email: {str(email_err)}")
+                    # Continue anyway, user can reset password later
+            
+            # Return success message instead of auto-login
             return {
-                "token": token,
-                "token_type": "Bearer",
-                "expires_at": expires_at,
-                "id": user.id,
-                "email": user.email,
-                "name": user.name,
-                "role": user.role,
-                "profile_image_url": user.profile_image_url,
-                "permissions": user_permissions,
+                "success": True,
+                "message": "Account created successfully. Please check your email for your temporary password.",
+                "email": user.email
             }
         else:
             raise HTTPException(500, detail=ERROR_MESSAGES.CREATE_USER_ERROR)
@@ -1079,3 +1198,179 @@ async def get_api_key(user=Depends(get_current_user)):
         }
     else:
         raise HTTPException(404, detail=ERROR_MESSAGES.API_KEY_NOT_FOUND)
+
+
+############################
+# OrganizationSignup
+############################
+
+
+@router.post("/signup/org/{org_code}")
+async def organization_signup(
+    request: Request, response: Response, org_code: str, form_data: SignupForm
+):
+    """Signup for a specific organization"""
+    from open_webui.models.organizations import Organizations
+    
+    # Get organization
+    organization = Organizations.get_organization_by_code(org_code)
+    if not organization:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail="Organization not found"
+        )
+    
+    if not organization.signup_enabled or organization.status != "active":
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail="Signup is not available for this organization"
+        )
+    
+    # Check if signups are allowed
+    if WEBUI_AUTH:
+        if not request.app.state.config.ENABLE_SIGNUP or not request.app.state.config.ENABLE_LOGIN_FORM:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.ACCESS_PROHIBITED
+            )
+    
+    if not validate_email_format(form_data.email.lower()):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail=ERROR_MESSAGES.INVALID_EMAIL_FORMAT
+        )
+    
+    if Users.get_user_by_email(form_data.email.lower()):
+        raise HTTPException(400, detail=ERROR_MESSAGES.EMAIL_TAKEN)
+    
+    try:
+        role = request.app.state.config.DEFAULT_USER_ROLE
+        
+        # Validate plan_id is in organization's plans if provided
+        if form_data.plan_id:
+            if not organization.plans or form_data.plan_id not in organization.plans:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid subscription plan for this organization"
+                )
+            
+            plan = SubscriptionPlans.get_plan_by_id(form_data.plan_id)
+            if not plan:
+                raise HTTPException(
+                    status.HTTP_404_NOT_FOUND,
+                    detail="Subscription plan not found"
+                )
+        
+        # Generate a random temporary password if email signup is enabled
+        if ENABLE_SIGNUP_EMAIL.value:
+            temp_password = generate_random_password(12)
+            hashed = get_password_hash(temp_password)
+        else:
+            if len(form_data.password.encode("utf-8")) > 72:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    detail=ERROR_MESSAGES.PASSWORD_TOO_LONG,
+                )
+            temp_password = form_data.password
+            hashed = get_password_hash(form_data.password)
+        
+        user = Auths.insert_new_auth(
+            form_data.email.lower(),
+            hashed,
+            form_data.name,
+            form_data.profile_image_url,
+            role,
+            dob=form_data.dob,
+            phone=form_data.phone,
+        )
+        
+        if user:
+            # Add user to organization
+            Organizations.add_users_to_organization(organization.id, [user.id])
+            
+            # Create subscription and add to group if plan_id is provided
+            if form_data.plan_id:
+                subscription_form = CreateSubscriptionForm(
+                    plan_id=form_data.plan_id,
+                    payment_id=form_data.payment_id,
+                    payment_method="stripe",
+                )
+                subscription = UserSubscriptions.create_subscription(user.id, subscription_form)
+                
+                # Update user with subscription info
+                Users.update_user_by_id(
+                    user.id,
+                    {
+                        "subscription_id": subscription.id if subscription else None,
+                        "subscription_status": subscription.status if subscription else None,
+                    },
+                )
+                
+                # Add user to the plan's users array
+                plan = SubscriptionPlans.get_plan_by_id(form_data.plan_id)
+                if plan:
+                    SubscriptionPlans.add_user_to_plan(plan.id, user.id)
+                    
+                    # Add user to the plan's group to grant model access
+                    if plan.group:
+                        Groups.add_users_to_group(plan.group, [user.id])
+            
+            # Send welcome email with temporary password
+            if ENABLE_SIGNUP_EMAIL.value:
+                try:
+                    # Initialize email service
+                    email_service = EmailService(
+                        smtp_host=SMTP_HOST.value,
+                        smtp_port=SMTP_PORT.value,
+                        smtp_username=SMTP_USERNAME.value,
+                        smtp_password=SMTP_PASSWORD.value,
+                        from_email=SMTP_FROM_EMAIL.value,
+                        from_name=SMTP_FROM_NAME.value,
+                        use_tls=SMTP_USE_TLS.value,
+                    )
+                    
+                    # Generate email template
+                    html_content = get_welcome_email_template(
+                        user_name=user.name,
+                        user_email=user.email,
+                        password=temp_password
+                    )
+                    
+                    # Send email
+                    email_sent = email_service.send_email(
+                        to_email=user.email,
+                        subject=f"Welcome to {organization.org_name} - Your Account Credentials",
+                        html_content=html_content
+                    )
+                    
+                    if not email_sent:
+                        log.error(f"Failed to send welcome email to {user.email}")
+                        # Continue anyway, user can reset password later
+                
+                except Exception as email_err:
+                    log.error(f"Error sending welcome email: {str(email_err)}")
+                    # Continue anyway, user can reset password later
+            
+            # Post webhook if configured
+            if request.app.state.config.WEBHOOK_URL:
+                await post_webhook(
+                    request.app.state.WEBUI_NAME,
+                    request.app.state.config.WEBHOOK_URL,
+                    WEBHOOK_MESSAGES.USER_SIGNUP(user.name),
+                    {
+                        "action": "signup",
+                        "message": WEBHOOK_MESSAGES.USER_SIGNUP(user.name),
+                        "user": user.model_dump_json(exclude_none=True),
+                        "organization": organization.org_name,
+                    },
+                )
+            
+            # Return success message instead of auto-login (follow normal signup flow)
+            return {
+                "success": True,
+                "message": "Account created successfully. Please check your email for your temporary password.",
+                "email": user.email
+            }
+    except HTTPException:
+        raise
+    except Exception as err:
+        log.exception(f"Error during organization signup: {err}")
+        raise HTTPException(500, detail=ERROR_MESSAGES.DEFAULT(err))

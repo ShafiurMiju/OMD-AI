@@ -93,6 +93,8 @@ from open_webui.routers import (
     users,
     utils,
     scim,
+    subscriptions,
+    organizations,
 )
 
 from open_webui.routers.retrieval import (
@@ -1332,6 +1334,7 @@ app.include_router(configs.router, prefix="/api/v1/configs", tags=["configs"])
 
 app.include_router(auths.router, prefix="/api/v1/auths", tags=["auths"])
 app.include_router(users.router, prefix="/api/v1/users", tags=["users"])
+app.include_router(subscriptions.router, prefix="/api/v1/subscriptions", tags=["subscriptions"])
 
 
 app.include_router(channels.router, prefix="/api/v1/channels", tags=["channels"])
@@ -1347,6 +1350,7 @@ app.include_router(tools.router, prefix="/api/v1/tools", tags=["tools"])
 app.include_router(memories.router, prefix="/api/v1/memories", tags=["memories"])
 app.include_router(folders.router, prefix="/api/v1/folders", tags=["folders"])
 app.include_router(groups.router, prefix="/api/v1/groups", tags=["groups"])
+app.include_router(organizations.router, prefix="/api/v1/organizations", tags=["organizations"])
 app.include_router(files.router, prefix="/api/v1/files", tags=["files"])
 app.include_router(functions.router, prefix="/api/v1/functions", tags=["functions"])
 app.include_router(
